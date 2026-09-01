@@ -12,6 +12,15 @@ type McpServer = { id: number; name: string; url: string; enabled: boolean; auth
 type McpTool = { name: string; description?: string; inputSchema?: Record<string, unknown> };
 type Todo = { id: number; text: string; meta: string; done: boolean };
 type ClaudeModel = { id: string; display_name: string; created_at?: string };
+type AiConnectionMode = "api" | "app-server";
+type AppServerConfig = { endpoint: string; token: string };
+type CodexRpcMessage = {
+  id?: number | string;
+  method?: string;
+  params?: Record<string, unknown>;
+  result?: Record<string, unknown>;
+  error?: { message?: string };
+};
 type ChatAttachment = { id: number; name: string; kind: "image" | "text"; mediaType: string; data: string };
 type ToolTrace = { name: string; server?: string; input?: unknown; output?: unknown; status: "完成" | "失败" | "等待确认" };
 type TokenUsage = { input: number; output: number; total: number };
@@ -112,6 +121,135 @@ function normalizeAiApiBase(value: string) {
 
 function apiProtocolFor(base: string): ApiProtocol {
   return /(^|\.)anthropic\.com\b|\/anthropic\b/i.test(base) ? "anthropic" : "openai";
+}
+
+function appServerSocketUrl(config: AppServerConfig) {
+  const endpoint = config.endpoint.trim();
+  if (!endpoint) throw new Error("请先填写 app-server WebSocket 地址");
+  const url = new URL(endpoint);
+  if (url.protocol === "http:") url.protocol = "ws:";
+  if (url.protocol === "https:") url.protocol = "wss:";
+  if (!/^wss?:$/.test(url.protocol)) throw new Error("app-server 地址必须使用 ws:// 或 wss://");
+  if (config.token.trim()) url.searchParams.set("token", config.token.trim());
+  return url.toString();
+}
+
+function codexAssistantText(item: Record<string, unknown>) {
+  if (typeof item.text === "string") return item.text;
+  if (!Array.isArray(item.content)) return "";
+  return item.content.flatMap((part) => {
+    if (!part || typeof part !== "object") return [];
+    const value = part as { type?: unknown; text?: unknown };
+    return typeof value.text === "string" && ["text", "output_text", "assistant_text"].includes(String(value.type || "text")) ? [value.text] : [];
+  }).join("");
+}
+
+async function runAppServerTurn({
+  config,
+  threadId,
+  input,
+  clientUserMessageId,
+  developerInstructions,
+}: {
+  config: AppServerConfig;
+  threadId: string;
+  input: Array<Record<string, unknown>>;
+  clientUserMessageId: string;
+  developerInstructions: string;
+}): Promise<{ text: string; reasoning: string; threadId: string }> {
+  const socket = new WebSocket(appServerSocketUrl(config));
+  let rpcId = 1;
+  let currentThreadId = threadId;
+  let completed = false;
+  const pending = new Map<number | string, { resolve: (message: CodexRpcMessage) => void; reject: (error: Error) => void }>();
+  const streamed = new Map<string, string>();
+  const completedMessages = new Map<string, string>();
+  const reasoning: string[] = [];
+
+  const sendRpc = (method: string, params: Record<string, unknown>) => new Promise<CodexRpcMessage>((resolve, reject) => {
+    const id = rpcId++;
+    pending.set(id, { resolve, reject });
+    socket.send(JSON.stringify({ id, method, params }));
+  });
+
+  return await new Promise((resolve, reject) => {
+    const timeout = globalThis.setTimeout(() => finish(new Error("app-server 回复超时")), 180000);
+    const finish = (error?: Error) => {
+      if (completed) return;
+      completed = true;
+      globalThis.clearTimeout(timeout);
+      pending.forEach((request) => request.reject(error || new Error("连接已关闭")));
+      pending.clear();
+      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) socket.close();
+      if (error) {
+        reject(error);
+        return;
+      }
+      const text = [...completedMessages.values(), ...[...streamed.entries()].filter(([id]) => !completedMessages.has(id)).map(([, value]) => value)]
+        .map((value) => value.trim()).filter(Boolean).join("\n\n");
+      resolve({ text: text || "我在。", reasoning: reasoning.join("\n").trim(), threadId: currentThreadId });
+    };
+
+    socket.onerror = () => finish(new Error("Codex app-server 无法连接"));
+    socket.onclose = () => { if (!completed) finish(new Error("Codex app-server 已断开")); };
+    socket.onmessage = (event) => {
+      let message: CodexRpcMessage;
+      try { message = JSON.parse(String(event.data)) as CodexRpcMessage; }
+      catch { finish(new Error("app-server 返回了无法识别的消息")); return; }
+      if (message.id !== undefined && !message.method && pending.has(message.id)) {
+        const request = pending.get(message.id)!;
+        pending.delete(message.id);
+        if (message.error) request.reject(new Error(message.error.message || "Codex 请求失败"));
+        else request.resolve(message);
+        return;
+      }
+      const params = message.params || {};
+      if (message.method === "item/agentMessage/delta") {
+        const id = String(params.itemId || "assistant");
+        streamed.set(id, `${streamed.get(id) || ""}${String(params.delta || "")}`);
+        return;
+      }
+      if (message.method === "item/reasoning/summaryTextDelta") {
+        reasoning.push(String(params.delta || ""));
+        return;
+      }
+      if (message.method === "item/completed" && params.item && typeof params.item === "object") {
+        const item = params.item as Record<string, unknown>;
+        const id = String(item.id || params.itemId || `assistant-${completedMessages.size}`);
+        const text = (streamed.get(id) || codexAssistantText(item)).trim();
+        if (text) completedMessages.set(id, text);
+        return;
+      }
+      if (message.method === "currentTime/read" && message.id !== undefined) {
+        socket.send(JSON.stringify({ id: message.id, result: { currentTimeAt: Math.floor(Date.now() / 1000) } }));
+        return;
+      }
+      if (message.method?.includes("requestApproval") && message.id !== undefined) {
+        socket.send(JSON.stringify({ id: message.id, result: { decision: "decline" } }));
+        return;
+      }
+      if (message.method === "turn/completed") finish();
+      else if (message.method && message.id !== undefined) socket.send(JSON.stringify({ id: message.id, error: { code: -32601, message: "Rune does not support this app-server request" } }));
+    };
+
+    socket.onopen = () => {
+      void (async () => {
+        await sendRpc("initialize", { clientInfo: { name: "rune_web", title: "Rune", version: "1.0.0" }, capabilities: { experimentalApi: true, requestAttestation: false } });
+        socket.send(JSON.stringify({ method: "initialized" }));
+        if (currentThreadId) {
+          try { await sendRpc("thread/resume", { threadId: currentThreadId }); }
+          catch { currentThreadId = ""; }
+        }
+        if (!currentThreadId) {
+          const started = await sendRpc("thread/start", { approvalPolicy: "never", summary: "concise", developerInstructions });
+          const thread = (started.result?.thread || {}) as { id?: unknown };
+          currentThreadId = String(thread.id || "");
+          if (!currentThreadId) throw new Error("app-server 没有返回 thread id");
+        }
+        await sendRpc("turn/start", { threadId: currentThreadId, clientUserMessageId, input, summary: "concise" });
+      })().catch((error) => finish(error instanceof Error ? error : new Error("app-server 请求失败")));
+    };
+  });
 }
 
 function parseMcpPayload(text: string) {
@@ -949,6 +1087,8 @@ function DiaryView({ profile }: { profile: Profile }) {
 }
 
 function ChatView({
+  aiConnectionMode,
+  appServerConfig,
   aiApiBase,
   claudeKey,
   claudeModel,
@@ -962,6 +1102,8 @@ function ChatView({
   minimaxKey,
   elevenLabsKey,
 }: {
+  aiConnectionMode: AiConnectionMode;
+  appServerConfig: AppServerConfig;
   aiApiBase: string;
   voiceConfig: VoiceConfig;
   minimaxKey: string;
@@ -1730,8 +1872,10 @@ function ChatView({
       setClips({ ...clipsRef.current });
       setShownText((current) => Object.fromEntries(Object.entries(current).filter(([key]) => Number(key) < nextMessages.length)));
     }
-    if (!claudeKey || !claudeModel) {
-      const hint = "先去 Settings 连接 AI API 并选择模型，我就可以真正回复你了。";
+    if ((aiConnectionMode === "api" && (!claudeKey || !claudeModel)) || (aiConnectionMode === "app-server" && !appServerConfig.endpoint.trim())) {
+      const hint = aiConnectionMode === "app-server"
+        ? "先去 Settings 填写 Codex app-server 地址并保存测试，我就可以通过它回复你了。"
+        : "先去 Settings 连接 AI API 并选择模型，我就可以真正回复你了。";
       if (!callOnly) {
         messagesRef.current = [...nextMessages, { role: "assistant", text: hint, previousReplies: previousReplies.length ? previousReplies : undefined }];
         setMessages(messagesRef.current);
@@ -1741,6 +1885,53 @@ function ChatView({
 
     setSending(true);
     try {
+      if (aiConnectionMode === "app-server") {
+        const systemPrompt = `${profile.instructions || defaultProfile.instructions}\n\n${nowContext()}\n你正在 Rune 的私人聊天界面中回复。可以使用 [[split]] 拆成少量自然气泡。${voiceReady ? "需要额外发送语音条时，把语音内容放在 [[voice]] 与 [[/voice]] 之间。" : "不要输出 [[voice]] 标记。"}`;
+        const attachmentText = outgoingAttachments.filter((attachment) => attachment.kind === "text" && attachment.data)
+          .map((attachment) => `附件「${attachment.name}」内容：\n${attachment.data}`);
+        const appServerInput: Array<Record<string, unknown>> = [{ type: "text", text: [text || "请查看附件。", ...attachmentText].join("\n\n") }];
+        outgoingAttachments.filter((attachment) => attachment.kind === "image" && attachment.data).forEach((attachment) => {
+          appServerInput.push({ type: "image", url: `data:${attachment.mediaType || "image/jpeg"};base64,${attachment.data}` });
+        });
+        const threadKey = `rune-app-server-thread-${activeId || "current"}`;
+        const result = await runAppServerTurn({
+          config: appServerConfig,
+          threadId: localStorage.getItem(threadKey) || "",
+          input: appServerInput,
+          clientUserMessageId: crypto.randomUUID(),
+          developerInstructions: systemPrompt,
+        });
+        localStorage.setItem(threadKey, result.threadId);
+        const parsedParts = parseAssistantReply(result.text).map((part) => voiceReady
+          ? part
+          : { text: [part.text, part.voiceText].filter(Boolean).join("\n") });
+        const assistantMessages: ChatMessage[] = parsedParts.map((part, index) => ({
+          role: "assistant",
+          text: part.text,
+          voiceText: part.voiceText,
+          voice: !part.text && Boolean(part.voiceText),
+          ...(index === 0 && previousReplies.length ? { previousReplies } : {}),
+          ...(index === parsedParts.length - 1 && result.reasoning ? { reasoning: result.reasoning } : {}),
+        }));
+        const finalReply = assistantMessages.map((message) => [message.text, message.voiceText].filter(Boolean).join("\n")).filter(Boolean).join("\n");
+        lastAssistantSpeechRef.current = assistantMessages.map((message) => message.voiceText || message.text).filter(Boolean).join("\n");
+        const replyIndex = nextMessages.length;
+        if (!callOnly) {
+          messagesRef.current = [...nextMessages, ...assistantMessages];
+          setMessages(messagesRef.current);
+        }
+        if (finalReply) setHomeMessage(finalReply);
+        if (voiceReady && !callActiveRef.current) {
+          assistantMessages.forEach((message, offset) => {
+            if (!message.voiceText) return;
+            const messageIndex = replyIndex + offset;
+            prepareClip(messageIndex, message.voiceText)
+              .then((clip) => { if (voiceConfig.autoPlay && clip && offset === 0) playClip(messageIndex, clip.url); })
+              .catch(() => undefined);
+          });
+        }
+        return finalReply;
+      }
       const enabledMcp = mcpServers.filter((server) => server.enabled && /^https:\/\//.test(server.url));
       const runeTools = [
         { name: "add_todo", description: "在 Rune Diary 的指定日期添加待办。任何写入都必须先向用户展示确认。", input_schema: { type: "object", properties: { date: { type: "string", description: "YYYY-MM-DD" }, text: { type: "string" } }, required: ["date", "text"] } },
@@ -2228,7 +2419,9 @@ ${voiceReady ? "你可以同时发送文字和语音：正常文字直接写；�
               aria-label={listening ? "停止录音并发送" : "按住说话"}
             >{listening ? <span className="recording-stop" /> : <MicrophoneIcon />}</button>
           )}
-          {listening ? <small>{liveTranscript || "在听…"}</small> : claudeModels.length > 0 ? (
+          {listening ? <small>{liveTranscript || "在听…"}</small> : aiConnectionMode === "app-server" ? (
+            <small>Codex app-server</small>
+          ) : claudeModels.length > 0 ? (
             <select className="chat-model-select" value={claudeModel} onChange={(event) => setClaudeModel(event.target.value)} aria-label="当前模型">
               {claudeModels.map((model) => <option key={model.id} value={model.id}>{model.display_name || model.id}</option>)}
             </select>
@@ -2241,6 +2434,10 @@ ${voiceReady ? "你可以同时发送文字和语音：正常文字直接写；�
 }
 
 function SettingsView({
+  aiConnectionMode,
+  setAiConnectionMode,
+  appServerConfig,
+  setAppServerConfig,
   aiApiBase,
   setAiApiBase,
   theme,
@@ -2270,6 +2467,10 @@ function SettingsView({
   customTheme,
   setCustomTheme,
 }: {
+  aiConnectionMode: AiConnectionMode;
+  setAiConnectionMode: (mode: AiConnectionMode) => void;
+  appServerConfig: AppServerConfig;
+  setAppServerConfig: (config: AppServerConfig) => void;
   aiApiBase: string;
   setAiApiBase: (base: string) => void;
   profile: Profile;
@@ -2302,6 +2503,8 @@ function SettingsView({
   const fileRef = useRef<HTMLInputElement>(null);
   const [claudeStatus, setClaudeStatus] = useState("");
   const [loadingModels, setLoadingModels] = useState(false);
+  const [appServerStatus, setAppServerStatus] = useState("");
+  const [testingAppServer, setTestingAppServer] = useState(false);
   const [newMcp, setNewMcp] = useState({ name: "", url: "", authMode: "none" as "none" | "oauth" });
   const [mcpStatus, setMcpStatus] = useState("");
   const [avatarNote, setAvatarNote] = useState("");
@@ -2528,6 +2731,27 @@ function SettingsView({
     }
   };
 
+  const testAppServer = async () => {
+    setTestingAppServer(true);
+    setAppServerStatus("");
+    try {
+      const socket = new WebSocket(appServerSocketUrl(appServerConfig));
+      await new Promise<void>((resolve, reject) => {
+        const timer = globalThis.setTimeout(() => { socket.close(); reject(new Error("连接超时")); }, 12000);
+        socket.onopen = () => { globalThis.clearTimeout(timer); socket.close(); resolve(); };
+        socket.onerror = () => { globalThis.clearTimeout(timer); reject(new Error("WebSocket 地址无法连接")); };
+      });
+      localStorage.setItem("rune-app-server-endpoint", appServerConfig.endpoint.trim());
+      localStorage.setItem("rune-app-server-token", appServerConfig.token.trim());
+      setAiConnectionMode("app-server");
+      setAppServerStatus("连接成功，Chat 将通过 Codex app-server 回复。");
+    } catch (error) {
+      setAppServerStatus(`连接失败：${error instanceof Error ? error.message : "请检查地址和 Token"}`);
+    } finally {
+      setTestingAppServer(false);
+    }
+  };
+
   const enableNotifications = async () => {
     setEnablingNotifications(true);
     setNotificationStatus("");
@@ -2653,8 +2877,15 @@ function SettingsView({
       </details>
 
       <details className="settings-subgroup">
-        <summary><span><p className="eyebrow">AI connection</p><b>通用 AI API</b></span><i aria-hidden="true">›</i></summary>
+        <summary><span><p className="eyebrow">AI connection</p><b>AI 接入</b></span><i aria-hidden="true">›</i></summary>
       <section className="settings-section">
+        <label className="field-label">连接方式
+          <select value={aiConnectionMode} onChange={(event) => setAiConnectionMode(event.target.value as AiConnectionMode)}>
+            <option value="api">通用 AI API</option>
+            <option value="app-server">Codex app-server</option>
+          </select>
+        </label>
+        {aiConnectionMode === "api" ? <>
         <label className="field-label">API 地址<input type="url" value={aiApiBase} onChange={(event) => { setAiApiBase(event.target.value); setClaudeStatus(""); }} placeholder="https://api.example.com/v1" autoComplete="off" /></label>
         <label className="field-label">API Key<input type="password" value={claudeKey} onChange={(event) => { setClaudeKey(event.target.value); localStorage.setItem("rune-claude-key", event.target.value); setClaudeStatus(""); }} placeholder="sk-••••••••" autoComplete="off" /></label>
         <button className="solid-action" onClick={loadClaudeModels} disabled={loadingModels}>
@@ -2668,6 +2899,21 @@ function SettingsView({
         </label>
         {claudeStatus && <p className={claudeStatus.startsWith("连接成功") ? "success-note" : "error-note"}>{claudeStatus}</p>}
         <p className="setting-note">兼容 Anthropic 原生接口，以及提供 <code>/models</code> 与 <code>/chat/completions</code> 的 OpenAI-compatible 接口。部分服务商会阻止浏览器直连，这种情况需要开启 CORS 或使用服务器代理。</p>
+        </> : <>
+          <label className="field-label">WebSocket 地址
+            <input type="url" value={appServerConfig.endpoint} placeholder="wss://codex.r-vera.com" autoCapitalize="none" autoCorrect="off"
+              onChange={(event) => { setAppServerConfig({ ...appServerConfig, endpoint: event.target.value }); setAppServerStatus(""); }} />
+          </label>
+          <label className="field-label">设备 Token
+            <input type="password" value={appServerConfig.token} placeholder="app-server 网关的设备 Token" autoCapitalize="none" autoCorrect="off"
+              onChange={(event) => { setAppServerConfig({ ...appServerConfig, token: event.target.value }); setAppServerStatus(""); }} />
+          </label>
+          <button className="solid-action" onClick={testAppServer} disabled={testingAppServer}>
+            {testingAppServer ? "正在测试…" : "保存并测试"}
+          </button>
+          {appServerStatus && <p className={appServerStatus.startsWith("连接成功") ? "success-note" : "error-note"}>{appServerStatus}</p>}
+          <p className="setting-note">Rune 会直接通过 WebSocket 使用 Codex app-server。地址和 Token 只保存在当前设备；每个 Chat 会保存自己的 Codex thread，切换回来可以继续上一轮。</p>
+        </>}
       </section>
       </details>
       <details className="settings-subgroup">
@@ -2906,6 +3152,8 @@ export default function Pulse() {
   const [mcpServers, setMcpServers] = useState<McpServer[]>(defaultMcpServers);
   const [metDate, setMetDate] = useState("");
   const [claudeKey, setClaudeKey] = useState("");
+  const [aiConnectionMode, setAiConnectionMode] = useState<AiConnectionMode>("api");
+  const [appServerConfig, setAppServerConfig] = useState<AppServerConfig>({ endpoint: "wss://codex.r-vera.com", token: "" });
   const [aiApiBase, setAiApiBase] = useState("https://api.anthropic.com/v1");
   const [claudeModel, setClaudeModel] = useState("");
   const [claudeModels, setClaudeModels] = useState<ClaudeModel[]>([]);
@@ -2991,6 +3239,12 @@ export default function Pulse() {
       setMinimaxKey(migrateValue(MINIMAX_KEY_STORAGE));
       setElevenLabsKey(migrateValue(ELEVENLABS_KEY_STORAGE));
       setClaudeKey(migrateValue("rune-claude-key"));
+      const storedConnectionMode = migrateValue("rune-ai-connection-mode", "api");
+      setAiConnectionMode(storedConnectionMode === "app-server" ? "app-server" : "api");
+      setAppServerConfig({
+        endpoint: migrateValue("rune-app-server-endpoint", "wss://codex.r-vera.com"),
+        token: migrateValue("rune-app-server-token"),
+      });
       setAiApiBase(migrateValue("rune-ai-api-base", "https://api.anthropic.com/v1"));
       setClaudeModel(migrateValue("rune-claude-model"));
       const storedModels = migrateValue("rune-claude-models");
@@ -3048,6 +3302,13 @@ export default function Pulse() {
     localStorage.setItem("rune-ai-api-base", normalizeAiApiBase(aiApiBase));
   }, [aiApiBase]);
 
+  useEffect(() => {
+    if (typeof globalThis.document === "undefined") return;
+    localStorage.setItem("rune-ai-connection-mode", aiConnectionMode);
+    localStorage.setItem("rune-app-server-endpoint", appServerConfig.endpoint.trim());
+    localStorage.setItem("rune-app-server-token", appServerConfig.token.trim());
+  }, [aiConnectionMode, appServerConfig]);
+
   return (
     <div className={`app theme-${theme}`} style={theme === "custom" ? {
       "--custom-bg": customTheme.background,
@@ -3063,10 +3324,10 @@ export default function Pulse() {
         {surface && <RuneIsland surface={surface} profile={profile} onDismiss={() => setSurface(null)} onOpenChat={() => { setSurface(null); setTab("chat"); }} />}
         {tab === "home" && <HomeView goDiary={() => setTab("diary")} goChat={() => setTab("chat")} goSettings={() => setTab("settings")} anniversaries={anniversaries} health={health} metDate={metDate} homeMessage={homeMessage} homeMessageAt={homeMessageAt} profile={profile} />}
         <div className="persistent-chat-panel" hidden={tab !== "chat"}>
-          <ChatView aiApiBase={aiApiBase} claudeKey={claudeKey} claudeModel={claudeModel} claudeModels={claudeModels} setClaudeModel={setClaudeModel} goSettings={() => setTab("settings")} mcpServers={mcpServers} setHomeMessage={updateHomeMessage} profile={profile} voiceConfig={voiceConfig} minimaxKey={minimaxKey} elevenLabsKey={elevenLabsKey} />
+          <ChatView aiConnectionMode={aiConnectionMode} appServerConfig={appServerConfig} aiApiBase={aiApiBase} claudeKey={claudeKey} claudeModel={claudeModel} claudeModels={claudeModels} setClaudeModel={setClaudeModel} goSettings={() => setTab("settings")} mcpServers={mcpServers} setHomeMessage={updateHomeMessage} profile={profile} voiceConfig={voiceConfig} minimaxKey={minimaxKey} elevenLabsKey={elevenLabsKey} />
         </div>
         {tab === "diary" && <DiaryView profile={profile} />}
-        {tab === "settings" && <SettingsView aiApiBase={aiApiBase} setAiApiBase={setAiApiBase} theme={theme} setTheme={setTheme} customTheme={customTheme} setCustomTheme={setCustomTheme} anniversaries={anniversaries} setAnniversaries={setAnniversaries} health={health} setHealth={setHealth} mcpServers={mcpServers} setMcpServers={setMcpServers} metDate={metDate} setMetDate={setMetDate} claudeKey={claudeKey} setClaudeKey={setClaudeKey} claudeModel={claudeModel} setClaudeModel={setClaudeModel} claudeModels={claudeModels} setClaudeModels={setClaudeModels} profile={profile} setProfile={setProfile} voiceConfig={voiceConfig} setVoiceConfig={setVoiceConfig} minimaxKey={minimaxKey} setMinimaxKey={setMinimaxKey} elevenLabsKey={elevenLabsKey} setElevenLabsKey={setElevenLabsKey} />}
+        {tab === "settings" && <SettingsView aiConnectionMode={aiConnectionMode} setAiConnectionMode={setAiConnectionMode} appServerConfig={appServerConfig} setAppServerConfig={setAppServerConfig} aiApiBase={aiApiBase} setAiApiBase={setAiApiBase} theme={theme} setTheme={setTheme} customTheme={customTheme} setCustomTheme={setCustomTheme} anniversaries={anniversaries} setAnniversaries={setAnniversaries} health={health} setHealth={setHealth} mcpServers={mcpServers} setMcpServers={setMcpServers} metDate={metDate} setMetDate={setMetDate} claudeKey={claudeKey} setClaudeKey={setClaudeKey} claudeModel={claudeModel} setClaudeModel={setClaudeModel} claudeModels={claudeModels} setClaudeModels={setClaudeModels} profile={profile} setProfile={setProfile} voiceConfig={voiceConfig} setVoiceConfig={setVoiceConfig} minimaxKey={minimaxKey} setMinimaxKey={setMinimaxKey} elevenLabsKey={elevenLabsKey} setElevenLabsKey={setElevenLabsKey} />}
 
         <nav className="bottom-nav" aria-label="主导航">
           <button className={tab === "home" ? "active" : ""} onClick={() => setTab("home")} aria-label="首页"><i><NavIcon name="home" /></i><span>Home</span></button>
