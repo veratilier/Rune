@@ -1087,6 +1087,7 @@ function DiaryView({ profile }: { profile: Profile }) {
 }
 
 function ChatView({
+  isActive,
   aiConnectionMode,
   appServerConfig,
   aiApiBase,
@@ -1102,6 +1103,7 @@ function ChatView({
   minimaxKey,
   elevenLabsKey,
 }: {
+  isActive: boolean;
   aiConnectionMode: AiConnectionMode;
   appServerConfig: AppServerConfig;
   aiApiBase: string;
@@ -1667,12 +1669,30 @@ function ChatView({
     let cancelled = false;
     void loadConversations().then((stored) => {
       if (cancelled) return;
-      setConversations(stored);
-      setActiveId(Date.now());
+      const ordered = [...stored].sort((left, right) => right.updatedAt - left.updatedAt || right.id - left.id);
+      setConversations(ordered);
+      const latest = ordered[0];
+      if (latest) {
+        setActiveId(latest.id);
+        setMessages(latest.messages);
+      } else {
+        setActiveId(Date.now());
+      }
       hydrated.current = true;
     });
     return () => { cancelled = true; };
   }, []);
+
+  // 每次从其他模块重新进入 Chat，都回到最近实际更新过的对话。
+  // Chat 本身保持挂载，因此语音、附件等状态不会因为切换模块被销毁。
+  const chatWasActiveRef = useRef(false);
+  useEffect(() => {
+    const wasActive = chatWasActiveRef.current;
+    chatWasActiveRef.current = isActive;
+    if (!isActive || wasActive || !hydrated.current) return;
+    const latest = [...conversations].sort((left, right) => right.updatedAt - left.updatedAt || right.id - left.id)[0];
+    if (latest && latest.id !== activeId) openConversation(latest.id);
+  }, [isActive, conversations, activeId]);
 
   // 当前对话每次变动都写回历史，切走或刷新都不会丢。
   useEffect(() => {
@@ -3324,7 +3344,7 @@ export default function Pulse() {
         {surface && <RuneIsland surface={surface} profile={profile} onDismiss={() => setSurface(null)} onOpenChat={() => { setSurface(null); setTab("chat"); }} />}
         {tab === "home" && <HomeView goDiary={() => setTab("diary")} goChat={() => setTab("chat")} goSettings={() => setTab("settings")} anniversaries={anniversaries} health={health} metDate={metDate} homeMessage={homeMessage} homeMessageAt={homeMessageAt} profile={profile} />}
         <div className="persistent-chat-panel" hidden={tab !== "chat"}>
-          <ChatView aiConnectionMode={aiConnectionMode} appServerConfig={appServerConfig} aiApiBase={aiApiBase} claudeKey={claudeKey} claudeModel={claudeModel} claudeModels={claudeModels} setClaudeModel={setClaudeModel} goSettings={() => setTab("settings")} mcpServers={mcpServers} setHomeMessage={updateHomeMessage} profile={profile} voiceConfig={voiceConfig} minimaxKey={minimaxKey} elevenLabsKey={elevenLabsKey} />
+          <ChatView isActive={tab === "chat"} aiConnectionMode={aiConnectionMode} appServerConfig={appServerConfig} aiApiBase={aiApiBase} claudeKey={claudeKey} claudeModel={claudeModel} claudeModels={claudeModels} setClaudeModel={setClaudeModel} goSettings={() => setTab("settings")} mcpServers={mcpServers} setHomeMessage={updateHomeMessage} profile={profile} voiceConfig={voiceConfig} minimaxKey={minimaxKey} elevenLabsKey={elevenLabsKey} />
         </div>
         {tab === "diary" && <DiaryView profile={profile} />}
         {tab === "settings" && <SettingsView aiConnectionMode={aiConnectionMode} setAiConnectionMode={setAiConnectionMode} appServerConfig={appServerConfig} setAppServerConfig={setAppServerConfig} aiApiBase={aiApiBase} setAiApiBase={setAiApiBase} theme={theme} setTheme={setTheme} customTheme={customTheme} setCustomTheme={setCustomTheme} anniversaries={anniversaries} setAnniversaries={setAnniversaries} health={health} setHealth={setHealth} mcpServers={mcpServers} setMcpServers={setMcpServers} metDate={metDate} setMetDate={setMetDate} claudeKey={claudeKey} setClaudeKey={setClaudeKey} claudeModel={claudeModel} setClaudeModel={setClaudeModel} claudeModels={claudeModels} setClaudeModels={setClaudeModels} profile={profile} setProfile={setProfile} voiceConfig={voiceConfig} setVoiceConfig={setVoiceConfig} minimaxKey={minimaxKey} setMinimaxKey={setMinimaxKey} elevenLabsKey={elevenLabsKey} setElevenLabsKey={setElevenLabsKey} />}

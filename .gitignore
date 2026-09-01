@@ -1,0 +1,12 @@
+node_modules/
+.next/
+.vinext/
+.wrangler/
+.openai/
+dist/
+assets/
+pages/
+github-pages/
+github-pages-spa/
+*.tsbuildinfo
+*.log
