@@ -134,13 +134,19 @@ function appServerSocketUrl(config: AppServerConfig) {
   return url.toString();
 }
 
+const APP_SERVER_ASSISTANT_ITEM_TYPES = new Set(["agentMessage", "assistantMessage", "outputMessage"]);
+const APP_SERVER_ASSISTANT_CONTENT_TYPES = new Set(["text", "outputText", "output_text", "assistant_text"]);
+
 function codexAssistantText(item: Record<string, unknown>) {
+  const itemType = String(item.type || "");
+  if (!APP_SERVER_ASSISTANT_ITEM_TYPES.has(itemType)) return "";
+  if (item.role && item.role !== "assistant") return "";
   if (typeof item.text === "string") return item.text;
   if (!Array.isArray(item.content)) return "";
   return item.content.flatMap((part) => {
     if (!part || typeof part !== "object") return [];
     const value = part as { type?: unknown; text?: unknown };
-    return typeof value.text === "string" && ["text", "output_text", "assistant_text"].includes(String(value.type || "text")) ? [value.text] : [];
+    return typeof value.text === "string" && APP_SERVER_ASSISTANT_CONTENT_TYPES.has(String(value.type || "text")) ? [value.text] : [];
   }).join("");
 }
 
@@ -215,6 +221,8 @@ async function runAppServerTurn({
       }
       if (message.method === "item/completed" && params.item && typeof params.item === "object") {
         const item = params.item as Record<string, unknown>;
+        const itemType = String(item.type || "");
+        if (!APP_SERVER_ASSISTANT_ITEM_TYPES.has(itemType) || (item.role && item.role !== "assistant")) return;
         const id = String(item.id || params.itemId || `assistant-${completedMessages.size}`);
         const text = (streamed.get(id) || codexAssistantText(item)).trim();
         if (text) completedMessages.set(id, text);
