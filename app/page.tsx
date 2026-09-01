@@ -1208,11 +1208,20 @@ function ChatView({
     messagesRef.current = messages;
   }, [messages]);
 
+  const scrollToLatestTurn = (behavior: ScrollBehavior = "auto") => {
+    // Chat 面板常驻但切到其他模块时会被 hidden；等它重新参与布局后再滚动，
+    // 否则 Safari 会在高度为 0 的隐藏容器上忽略 scrollTo。
+    globalThis.requestAnimationFrame(() => globalThis.requestAnimationFrame(() => {
+      const stream = messageStreamRef.current;
+      if (!stream) return;
+      stream.scrollTo({ top: stream.scrollHeight, behavior });
+    }));
+  };
+
   useEffect(() => {
-    const stream = messageStreamRef.current;
-    if (!stream) return;
-    stream.scrollTo({ top: stream.scrollHeight, behavior: messages.length > 1 ? "smooth" : "auto" });
-  }, [messages, sending]);
+    if (!isActive) return;
+    scrollToLatestTurn(messages.length > 1 ? "smooth" : "auto");
+  }, [messages, sending, isActive]);
 
   useEffect(() => {
     if (typeof globalThis.location === "undefined") return;
@@ -1712,6 +1721,8 @@ function ChatView({
     if (!isActive || wasActive || !hydrated.current) return;
     const latest = [...conversations].sort((left, right) => right.updatedAt - left.updatedAt || right.id - left.id)[0];
     if (latest && latest.id !== activeId) openConversation(latest.id);
+    // 即使已经是最新会话，也必须回到它的最后一轮，而不是保留离开前的滚动位置。
+    scrollToLatestTurn("auto");
   }, [isActive, conversations, activeId]);
 
   // 当前对话每次变动都写回历史，切走或刷新都不会丢。
