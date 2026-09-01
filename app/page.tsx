@@ -24,7 +24,7 @@ type CodexRpcMessage = {
 type ChatAttachment = { id: number; name: string; kind: "image" | "text"; mediaType: string; data: string };
 type ToolTrace = { name: string; server?: string; input?: unknown; output?: unknown; status: "完成" | "失败" | "等待确认" };
 type TokenUsage = { input: number; output: number; total: number };
-type ChatMessage = { role: "user" | "assistant"; text: string; attachments?: ChatAttachment[]; voice?: boolean; voiceText?: string; callRecord?: VoiceCallRecord; reasoning?: string; toolTraces?: ToolTrace[]; usage?: TokenUsage; previousReplies?: ChatMessage[]; revisions?: Array<{ savedAt: number; messages: ChatMessage[] }> };
+type ChatMessage = { role: "user" | "assistant"; text: string; createdAt?: number; attachments?: ChatAttachment[]; voice?: boolean; voiceText?: string; callRecord?: VoiceCallRecord; reasoning?: string; toolTraces?: ToolTrace[]; usage?: TokenUsage; previousReplies?: ChatMessage[]; revisions?: Array<{ savedAt: number; messages: ChatMessage[] }> };
 type VoiceCallTurn = { at: number; user: string; assistant: string };
 type VoiceCallRecord = { id: string; startedAt: number; endedAt: number; duration: number; initiatedBy?: "user" | "assistant"; turns: VoiceCallTurn[] };
 type VoiceGenerationClaim = { callId: string; turnId: string; turnSequence: number; generationId: string };
@@ -684,6 +684,18 @@ function PhoneIcon() {
 
 function PhoneDownIcon() {
   return <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M4.8 14.8c4.7-3.7 9.7-3.7 14.4 0"/><path d="m6.7 13.5-1.4 3.1c-.3.7.1 1.5.8 1.8l2.7.9c.7.2 1.4-.2 1.6-.9l.5-1.8c.7-.2 1.5-.2 2.2 0l.5 1.8c.2.7.9 1.1 1.6.9l2.7-.9c.7-.3 1.1-1.1.8-1.8l-1.4-3.1"/></svg>;
+}
+
+function MessageCopyIcon() {
+  return <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="1.5"/><path d="M16 8V5.5A1.5 1.5 0 0 0 14.5 4h-10A1.5 1.5 0 0 0 3 5.5v10A1.5 1.5 0 0 0 4.5 17H8"/></svg>;
+}
+
+function MessageEditIcon() {
+  return <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m14.5 5.5 4 4M5 19l3.7-.8L19 7.9a1.8 1.8 0 0 0 0-2.5l-.4-.4a1.8 1.8 0 0 0-2.5 0L5.8 15.3 5 19Z"/><path d="M4 21h16"/></svg>;
+}
+
+function MessageTrashIcon() {
+  return <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5"/></svg>;
 }
 
 // 每次请求都把"此刻"算一遍塞进 system prompt。
@@ -1459,7 +1471,7 @@ function ChatView({
       turns: [...callTurnsRef.current],
     };
     // 通话期间的逐句内容收进这一条记录，不再把每轮散落在普通消息流里。
-    const callMessage: ChatMessage = { role: callInitiatorRef.current === "assistant" ? "assistant" : "user", text: "", callRecord: record };
+    const callMessage: ChatMessage = { role: callInitiatorRef.current === "assistant" ? "assistant" : "user", text: "", createdAt: record.startedAt, callRecord: record };
     messagesRef.current = [...messagesRef.current, callMessage];
     setMessages(messagesRef.current);
     callStartedAtRef.current = 0;
@@ -1766,6 +1778,7 @@ function ChatView({
     const callMessage: ChatMessage = {
       role: record.initiatedBy === "assistant" ? "assistant" : "user",
       text: "",
+      createdAt: record.startedAt,
       callRecord: record,
     };
     setActiveId(id);
@@ -1819,6 +1832,53 @@ function ChatView({
     globalThis.setTimeout(() => setChatNotice(""), 1800);
   };
 
+  const copyMessage = async (message: ChatMessage) => {
+    const content = [message.text, message.voiceText, ...(message.attachments || []).map((attachment) => attachment.name)]
+      .filter(Boolean).join("\n").trim();
+    if (!content) return;
+    try {
+      await navigator.clipboard.writeText(content);
+      setChatNotice("已复制");
+    } catch {
+      setChatNotice("复制失败，请长按文字复制");
+    }
+    globalThis.setTimeout(() => setChatNotice(""), 1500);
+  };
+
+  const deleteMessage = (index: number) => {
+    if (!globalThis.confirm("删除这条消息？")) return;
+    if (speakingIndex === index) stopAudio();
+    const nextMessages = messagesRef.current.filter((_, messageIndex) => messageIndex !== index);
+    messagesRef.current = nextMessages;
+    setMessages(nextMessages);
+    if (!nextMessages.length) {
+      setConversations((current) => current.filter((conversation) => conversation.id !== activeId));
+      setActiveId(Date.now());
+    }
+    const shiftedClips: Record<number, VoiceClip> = {};
+    Object.entries(clipsRef.current).forEach(([key, clip]) => {
+      const oldIndex = Number(key);
+      if (oldIndex === index) {
+        if (clip.url.startsWith("blob:")) URL.revokeObjectURL(clip.url);
+        return;
+      }
+      shiftedClips[oldIndex > index ? oldIndex - 1 : oldIndex] = clip;
+    });
+    clipsRef.current = shiftedClips;
+    setClips(shiftedClips);
+    setShownText((current) => Object.fromEntries(Object.entries(current).flatMap(([key, shown]) => {
+      const oldIndex = Number(key);
+      if (oldIndex === index) return [];
+      return [[String(oldIndex > index ? oldIndex - 1 : oldIndex), shown]];
+    })));
+    setSpeakingIndex((current) => current === null || current < index ? current : current === index ? null : current - 1);
+    setPreparingIndex((current) => current === null || current < index ? current : current === index ? null : current - 1);
+    setEditingIndex(null);
+    setEditDraft("");
+    setChatNotice("消息已删除");
+    globalThis.setTimeout(() => setChatNotice(""), 1500);
+  };
+
   const applyRuneAction = async (action: RuneAction) => {
     const date = action.input.date || localDateKey(new Date());
     if (action.name === "add_todo") {
@@ -1848,7 +1908,7 @@ function ChatView({
       }
     }
     setActions((items) => items.map((item) => item.id === action.id ? { ...item, status: "done" } : item));
-    setMessages((items) => [...items, { role: "assistant", text: `${action.name === "add_todo" ? "待办" : action.name === "write_diary" ? "日记" : action.name === "set_home_message" ? "首页文字" : "提醒"}已经更新。` }]);
+    setMessages((items) => [...items, { role: "assistant", text: `${action.name === "add_todo" ? "待办" : action.name === "write_diary" ? "日记" : action.name === "set_home_message" ? "首页文字" : "提醒"}已经更新。`, createdAt: Date.now() }]);
   };
 
   const sendMessage = async (spokenText?: string, editIndex?: number, callOnly = false): Promise<string> => {
@@ -1877,7 +1937,7 @@ function ChatView({
     const nextMessages: ChatMessage[] = callOnly
       ? [...messagesRef.current, ...callContext, { role: "user", text }]
       : editIndex === undefined
-        ? [...messagesRef.current, { role: "user", text, attachments: outgoingAttachments }]
+        ? [...messagesRef.current, { role: "user", text, createdAt: Date.now(), attachments: outgoingAttachments }]
         : [...messagesRef.current.slice(0, editIndex), editedUser!];
     if (!callOnly) {
       messagesRef.current = nextMessages;
@@ -1905,7 +1965,7 @@ function ChatView({
         ? "先去 Settings 填写 Codex app-server 地址并保存测试，我就可以通过它回复你了。"
         : "先去 Settings 连接 AI API 并选择模型，我就可以真正回复你了。";
       if (!callOnly) {
-        messagesRef.current = [...nextMessages, { role: "assistant", text: hint, previousReplies: previousReplies.length ? previousReplies : undefined }];
+        messagesRef.current = [...nextMessages, { role: "assistant", text: hint, createdAt: Date.now(), previousReplies: previousReplies.length ? previousReplies : undefined }];
         setMessages(messagesRef.current);
       }
       return hint;
@@ -1936,6 +1996,7 @@ function ChatView({
         const assistantMessages: ChatMessage[] = parsedParts.map((part, index) => ({
           role: "assistant",
           text: part.text,
+          createdAt: Date.now() + index,
           voiceText: part.voiceText,
           voice: !part.text && Boolean(part.voiceText),
           ...(index === 0 && previousReplies.length ? { previousReplies } : {}),
@@ -2140,6 +2201,7 @@ ${voiceReady ? "你可以同时发送文字和语音：正常文字直接写；�
       const assistantMessages: ChatMessage[] = parsedParts.map((part, index) => ({
         role: "assistant",
         text: part.text,
+        createdAt: Date.now() + index,
         voiceText: part.voiceText,
         voice: !part.text && Boolean(part.voiceText),
         ...(index === 0 && previousReplies.length ? { previousReplies } : {}),
@@ -2174,7 +2236,7 @@ ${voiceReady ? "你可以同时发送文字和语音：正常文字直接写；�
     } catch (error) {
       const failure = `连接失败：${error instanceof Error ? error.message : "请检查 API Key 和网络。"}`;
       if (!callOnly) {
-        messagesRef.current = [...nextMessages, { role: "assistant", text: failure, previousReplies: previousReplies.length ? previousReplies : undefined }];
+        messagesRef.current = [...nextMessages, { role: "assistant", text: failure, createdAt: Date.now(), previousReplies: previousReplies.length ? previousReplies : undefined }];
         setMessages(messagesRef.current);
       }
       return failure;
@@ -2184,6 +2246,7 @@ ${voiceReady ? "你可以同时发送文字和语音：正常文字直接写；�
   };
 
   const callLabel = { idle: "接通中…", listening: "在听你说", thinking: "正在想", speaking: `${profile.name || "Rune"} 在说`, waiting: "麦克风需要重新连接" }[callStage];
+  const activeConversationTime = conversations.find((conversation) => conversation.id === activeId)?.updatedAt || activeId || Date.now();
 
   return (
     <main className="page claude-chat-page">
@@ -2297,6 +2360,7 @@ ${voiceReady ? "你可以同时发送文字和语音：正常文字直接写；�
             <div>
               {/* 自己发的消息不显示昵称，头像已经足够区分 */}
               {message.role === "assistant" && <span className="msg-name">{profile.name || "Rune"}</span>}
+              <div className="message-body">
               {!!message.attachments?.length && <div className="sent-attachments">
                 {message.attachments.map((attachment) => attachment.kind === "image" && attachment.data ? (
                   <a className="sent-image" key={attachment.id} href={`data:${attachment.mediaType || "image/jpeg"};base64,${attachment.data}`} target="_blank" rel="noreferrer" aria-label={`查看图片 ${attachment.name}`}>
@@ -2348,8 +2412,14 @@ ${voiceReady ? "你可以同时发送文字和语音：正常文字直接写；�
                 </div>}
                 </>
               )}
-              {message.role === "user" && !message.callRecord && editingIndex !== index && !sending && (
-                <button className="message-edit-button" onClick={() => { setEditingIndex(index); setEditDraft(message.text); }}>编辑</button>
+              </div>
+              {!message.callRecord && editingIndex !== index && (
+                <div className="message-actions" aria-label="消息操作">
+                  <time>{new Date(message.createdAt || activeConversationTime).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time>
+                  <button onClick={() => void copyMessage(message)} aria-label="复制消息" title="复制"><MessageCopyIcon /></button>
+                  {message.role === "user" && !sending && <button onClick={() => { setEditingIndex(index); setEditDraft(message.text); }} aria-label="编辑消息" title="编辑"><MessageEditIcon /></button>}
+                  <button onClick={() => deleteMessage(index)} aria-label="删除消息" title="删除"><MessageTrashIcon /></button>
+                </div>
               )}
               {message.role === "user" && !!message.revisions?.length && (
                 <details className="message-revisions">

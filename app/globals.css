@@ -267,7 +267,8 @@ h1 { font-family:var(--serif); font-weight:500; letter-spacing:-.035em; }
 .claude-message { display:flex; gap:9px; font-family:var(--sans); font-size:12px; font-weight:400; line-height:1.7; white-space:pre-wrap; }
 .claude-message.user { justify-content:flex-end; }
 .claude-message p { margin:0; }
-.claude-message.user > div { max-width:84%; padding:10px 13px; border-radius:16px; background:rgba(118,118,128,.1); }
+.claude-message.user > div { max-width:84%; padding:0; background:transparent; }
+.claude-message.user .message-body { padding:10px 13px; border-radius:16px; background:rgba(118,118,128,.1); }
 .claude-message.assistant { align-items:flex-start; }
 .claude-message.assistant > div { padding-top:3px; }
 .claude-message .assistant-mark { width:23px; height:23px; border-radius:7px; font-size:15px; }
@@ -279,8 +280,13 @@ h1 { font-family:var(--serif); font-weight:500; letter-spacing:-.035em; }
 .message-trace section > b em { color:#8d877f; font-size:8px; font-style:normal; font-weight:500; }
 .message-trace section > p,.message-trace pre { margin:5px 0 0; overflow:auto; color:#6f6961; font:8.5px/1.55 var(--sans); white-space:pre-wrap; word-break:break-word; }
 .message-usage { display:block; margin-top:5px; color:var(--muted); font-size:8px; opacity:.58; }
-.message-edit-button { display:block; margin:5px 0 -3px auto; padding:2px 1px; border:0; background:transparent; color:var(--muted); font-size:8px; cursor:pointer; opacity:.72; }
 .claude-message.user.editing > div { width:min(330px,calc(100vw - 74px)); max-width:100%; padding:0; background:transparent; }
+.claude-message.user.editing .message-body { padding:0; background:transparent; }
+.message-actions { display:flex; align-items:center; gap:10px; min-height:22px; margin-top:5px; color:var(--muted); opacity:.7; }
+.claude-message.user .message-actions { justify-content:flex-end; padding-right:2px; }
+.message-actions time { margin-right:1px; font-family:var(--serif); font-size:9px; font-variant-numeric:tabular-nums; }
+.message-actions button { width:22px; height:22px; display:grid; place-items:center; padding:0; border:0; background:transparent; color:inherit; cursor:pointer; border-radius:7px; }
+.message-actions button:active { background:color-mix(in srgb,var(--ink) 8%,transparent); opacity:1; }
 .message-edit-form { box-sizing:border-box; width:100%; padding:9px; border:1px solid rgba(60,55,49,.12); border-radius:15px; background:rgba(118,118,128,.08); }
 .message-edit-form textarea { box-sizing:border-box; width:100%; min-height:82px; resize:vertical; padding:9px 10px; border:1px solid rgba(60,55,49,.15); border-radius:11px; outline:0; background:rgba(255,255,255,.78); color:var(--ink); font:400 16px/1.5 var(--sans); }
 .message-edit-form > div { display:flex; justify-content:flex-end; gap:6px; margin-top:6px; }
@@ -521,6 +527,7 @@ html[data-keyboard-open] .claude-composer { bottom:0; border-radius:17px 17px 0 
 
 /* 通话在消息流中只占一条，点开再看完整逐轮记录。 */
 .claude-message.call-entry > div { max-width:min(310px,82%); padding:0; background:transparent; }
+.claude-message.call-entry .message-body { padding:0; background:transparent; }
 .call-message-card { min-width:210px; white-space:normal; }
 .call-message-card > summary { display:flex; align-items:center; justify-content:space-between; gap:18px; padding:12px 15px; border:1px solid color-mix(in srgb,var(--accent) 26%,var(--border)); border-radius:15px; background:color-mix(in srgb,var(--accent) 17%,var(--surface-strong)); color:var(--ink); cursor:pointer; list-style:none; font-size:14px; font-variant-numeric:tabular-nums; }
 .call-message-card > summary::-webkit-details-marker { display:none; }
